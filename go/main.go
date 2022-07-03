@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -40,6 +41,7 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
+	cacheTimeForTrend           = time.Second * 3
 )
 
 var (
@@ -50,7 +52,27 @@ var (
 	jiaJWTSigningKey *ecdsa.PublicKey
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
+	trendCacher                   TrendCacher
 )
+
+type TrendCacher struct {
+	mu        sync.RWMutex
+	trend     []TrendResponse
+	lastSaved time.Time
+}
+
+func (t *TrendCacher) Add(r []TrendResponse) {
+	t.mu.Lock()
+	t.trend = r
+	t.lastSaved = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *TrendCacher) Get() ([]TrendResponse, time.Time) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.trend, t.lastSaved
+}
 
 type Config struct {
 	Name string `db:"name"`
@@ -207,6 +229,7 @@ func init() {
 }
 
 func main() {
+	trendCacher = TrendCacher{}
 	e := echo.New()
 	e.Debug = true
 	e.Logger.SetLevel(log.DEBUG)
@@ -1077,6 +1100,10 @@ func calculateConditionLevel(condition string) (string, error) {
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
 func getTrend(c echo.Context) error {
+	trends, lastSaved := trendCacher.Get()
+	if len(trends) != 0 && lastSaved.After(time.Now().Add(-cacheTimeForTrend)) {
+		return c.JSON(http.StatusOK, trends)
+	} else {
 	characterList := []Isu{}
 	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
 	if err != nil {
@@ -1150,6 +1177,9 @@ func getTrend(c echo.Context) error {
 				Warning:   characterWarningIsuConditions,
 				Critical:  characterCriticalIsuConditions,
 			})
+		}
+		trendCacher.Add(res)
+		return c.JSON(http.StatusOK, res)
 	}
 
 	return c.JSON(http.StatusOK, res)
