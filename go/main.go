@@ -1182,7 +1182,6 @@ func getTrend(c echo.Context) error {
 		return c.JSON(http.StatusOK, res)
 	}
 
-	return c.JSON(http.StatusOK, res)
 }
 
 // POST /api/condition/:jia_isu_uuid
