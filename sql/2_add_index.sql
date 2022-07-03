@@ -1,0 +1,1 @@
+create index jia_isu_uuid_index on isu_condition(jia_isu_uuid DESC);
