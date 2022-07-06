@@ -89,7 +89,16 @@ func (i *IsuConditionCache) Get(key string) []IsuCondition {
 func (i *IsuConditionCache) Add(key string, conds []IsuCondition) {
 	i.mu.Lock()
 	sort.Slice(conds, func(i, j int) bool { return conds[i].Timestamp.Before(conds[j].Timestamp) })
-	i.cache[key] = append(i.cache[key], conds...)
+
+	if len(i.cache[key]) > 0 && conds[0].Timestamp.Before(i.cache[key][len(i.cache[key])-1].Timestamp) {
+		n := append(i.cache[key], conds...)
+		newl := make([]IsuCondition, len(n))
+		copy(newl, n)
+		sort.Slice(newl, func(i, j int) bool { return newl[i].Timestamp.Before(newl[j].Timestamp) })
+		i.cache[key] = newl
+	} else {
+		i.cache[key] = append(i.cache[key], conds...)
+	}
 	i.mu.Unlock()
 }
 
@@ -853,19 +862,18 @@ func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Tim
 	conditionsInThisHour := []IsuCondition{}
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
-	var condition IsuCondition
+	// var condition IsuCondition
 
-	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
-	if err != nil {
-		return nil, fmt.Errorf("db error: %v", err)
-	}
-
-	for rows.Next() {
-		err = rows.StructScan(&condition)
+	a := isuConditionCacher.Get(jiaIsuUUID)
+	all := make([]IsuCondition, len(a))
+	copy(all, a)
+	/*
+		rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("db error: %v", err)
 		}
-
+	*/
+	for _, condition := range all {
 		truncatedConditionTime := condition.Timestamp.Truncate(time.Hour)
 		if truncatedConditionTime != startTimeInThisHour {
 			if len(conditionsInThisHour) > 0 {
@@ -1079,20 +1087,19 @@ func getIsuConditions(c echo.Context) error {
 func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string, c echo.Context) ([]*GetIsuConditionResponse, error) {
 
-	conditions := []IsuCondition{}
+	var conditions []IsuCondition
 	var err error
 
-	all := isuConditionCacher.Get(jiaIsuUUID)
+	a := isuConditionCacher.Get(jiaIsuUUID)
+	all := make([]IsuCondition, len(a))
+	copy(all, a)
 	c.Logger().Info("getIsuConditionsFromDB | start + " + strconv.Itoa(int(startTime.Unix())) + " end " + strconv.Itoa(int(endTime.Unix())))
 	if startTime.IsZero() {
 		i := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) })
 		if i != 0 {
-			// なんで？
 			conditions = all[:i-1]
 		}
-		for i := 0; i < len(conditions)/2; i++ {
-			conditions[i], conditions[len(conditions)-i-1] = conditions[len(conditions)-i-1], conditions[i]
-		}
+		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
 			s := "!!!!(end)"
 			for _, c := range conditions {
@@ -1118,39 +1125,33 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		end := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) })
 
 		if start == end || start == len(all) || end == 0 {
-			c.Logger().Info("??? start : "+strconv.Itoa(start)+" end: "+strconv.Itoa(end)+" length: "+strconv.Itoa(len(all)), all[start])
 			conditions = []IsuCondition{}
 		} else {
 			conditions = all[start : end-1]
 		}
-
 		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
-			for i := 0; i < len(conditions)/2; i++ {
-				conditions[i], conditions[len(conditions)-i-1] = conditions[len(conditions)-i-1], conditions[i]
+			c.Logger().Info(all)
+			s := "!!!!(s)"
+			for _, c := range conditions {
+				s += strconv.Itoa(int(c.Timestamp.Unix())) + ","
 			}
+			// DB
+			tmpConditions := []IsuCondition{}
+			err = db.Select(&tmpConditions,
+				"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
+					"	AND `timestamp` < ?"+
+					"	AND ? <= `timestamp`"+
+					"	ORDER BY `timestamp` DESC",
+				jiaIsuUUID, endTime, startTime,
+			)
+
+			s += " --- "
+			for _, c := range tmpConditions {
+				s += strconv.Itoa(int(c.Timestamp.Unix())) + ","
+			}
+			c.Logger().Info(s)
 		*/
-
-		s := "!!!!(s)"
-		for _, c := range conditions {
-			s += strconv.Itoa(int(c.Timestamp.Unix())) + ","
-		}
-		// DB
-		tmpConditions := []IsuCondition{}
-		err = db.Select(&tmpConditions,
-			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
-				"	AND `timestamp` < ?"+
-				"	AND ? <= `timestamp`"+
-				"	ORDER BY `timestamp` DESC",
-			jiaIsuUUID, endTime, startTime,
-		)
-
-		s += " --- "
-		for _, c := range tmpConditions {
-			s += strconv.Itoa(int(c.Timestamp.Unix())) + ","
-		}
-		c.Logger().Info(s)
-
 	}
 	if err != nil {
 		return nil, fmt.Errorf("db error: %v", err)
@@ -1369,10 +1370,7 @@ func postIsuCondition(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	go func() {
-		time.Sleep(500 * time.Microsecond)
-		isuConditionCacher.Add(jiaIsuUUID, conds)
-	}()
+	isuConditionCacher.Add(jiaIsuUUID, conds)
 
 	return c.NoContent(http.StatusAccepted)
 }
