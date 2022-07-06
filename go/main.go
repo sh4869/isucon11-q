@@ -1085,13 +1085,12 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 	var err error
 
 	a := isuConditionCacher.Get(jiaIsuUUID)
-	all := make([]IsuCondition, len(a))
-	copy(all, a)
 	c.Logger().Info("getIsuConditionsFromDB | start + " + strconv.Itoa(int(startTime.Unix())) + " end " + strconv.Itoa(int(endTime.Unix())))
 	if startTime.IsZero() {
-		i := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) || all[i].Timestamp.Equal(endTime) })
+		i := sort.Search(len(a), func(i int) bool { return a[i].Timestamp.After(endTime) || a[i].Timestamp.Equal(endTime) })
 		if i != 0 {
-			conditions = all[:i]
+			conditions = make([]IsuCondition, i)
+			copy(conditions, a[:i])
 		}
 		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
@@ -1115,13 +1114,15 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 			c.Logger().Info(s)
 		*/
 	} else {
-		start := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(startTime) || all[i].Timestamp.Equal(startTime) })
-		end := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) || all[i].Timestamp.Equal(endTime) })
+		start := sort.Search(len(a), func(i int) bool { return a[i].Timestamp.After(startTime) || a[i].Timestamp.Equal(startTime) })
+		end := sort.Search(len(a), func(i int) bool { return a[i].Timestamp.After(endTime) || a[i].Timestamp.Equal(endTime) })
 
-		if start == end || start == len(all) || end == 0 {
+		if start == end || start == len(a) || end == 0 {
 			conditions = []IsuCondition{}
 		} else {
-			conditions = all[start:end]
+			// all := make([]IsuCondition, len(a))
+			conditions = make([]IsuCondition, end-start)
+			copy(conditions, a[start:end])
 			sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		}
 		/*
