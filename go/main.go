@@ -867,12 +867,6 @@ func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Tim
 	a := isuConditionCacher.Get(jiaIsuUUID)
 	all := make([]IsuCondition, len(a))
 	copy(all, a)
-	/*
-		rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
-		if err != nil {
-			return nil, fmt.Errorf("db error: %v", err)
-		}
-	*/
 	for _, condition := range all {
 		truncatedConditionTime := condition.Timestamp.Truncate(time.Hour)
 		if truncatedConditionTime != startTimeInThisHour {
@@ -1095,9 +1089,9 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 	copy(all, a)
 	c.Logger().Info("getIsuConditionsFromDB | start + " + strconv.Itoa(int(startTime.Unix())) + " end " + strconv.Itoa(int(endTime.Unix())))
 	if startTime.IsZero() {
-		i := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) })
+		i := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) || all[i].Timestamp.Equal(endTime) })
 		if i != 0 {
-			conditions = all[:i-1]
+			conditions = all[:i]
 		}
 		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
@@ -1122,14 +1116,14 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		*/
 	} else {
 		start := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(startTime) || all[i].Timestamp.Equal(startTime) })
-		end := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) })
+		end := sort.Search(len(all), func(i int) bool { return all[i].Timestamp.After(endTime) || all[i].Timestamp.Equal(endTime) })
 
 		if start == end || start == len(all) || end == 0 {
 			conditions = []IsuCondition{}
 		} else {
-			conditions = all[start : end-1]
+			conditions = all[start:end]
+			sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		}
-		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
 			c.Logger().Info(all)
 			s := "!!!!(s)"
@@ -1299,7 +1293,7 @@ func getTrend(c echo.Context) error {
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
 	// TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-	dropProbability := 0.7
+	dropProbability := 0.3
 	if rand.Float64() <= dropProbability {
 		c.Logger().Warnf("drop post isu condition request")
 		return c.NoContent(http.StatusAccepted)
