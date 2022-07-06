@@ -54,6 +54,7 @@ var (
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
 	trendCacher                   TrendCacher
 	isuConditionCacher            IsuConditionCache
+	imageCacher                   ImageCache
 )
 
 type TrendCacher struct {
@@ -113,6 +114,27 @@ func (i *IsuConditionCache) AddList(conds []IsuCondition) {
 		i.cache[k] = append(i.cache[k], v...)
 	}
 	i.mu.Unlock()
+}
+
+type ImageCache struct {
+	m sync.Map
+}
+
+type ImageCacheData struct {
+	image  []byte
+	userId string
+}
+
+func (i *ImageCache) Save(key string, data ImageCacheData) {
+	i.m.Store(key, data)
+}
+
+func (i *ImageCache) Get(key string) ImageCacheData {
+	if v, ok := i.m.Load(key); ok {
+		return v.(ImageCacheData)
+	}
+	return ImageCacheData{}
+
 }
 
 type Config struct {
@@ -273,6 +295,7 @@ func init() {
 func main() {
 	trendCacher = TrendCacher{}
 	isuConditionCacher = IsuConditionCache{cache: map[string][]IsuCondition{}}
+	imageCacher = ImageCache{m: sync.Map{}}
 
 	e := echo.New()
 	// e.Debug = true
@@ -784,19 +807,27 @@ func getIsuIcon(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
-	var image []byte
-	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	image := imageCacher.Get(jiaIsuUUID)
+	if image.userId != "" {
+		if image.userId != jiaUserID {
 			return c.String(http.StatusNotFound, "not found: isu")
 		}
+		return c.Blob(http.StatusOK, "", image.image)
+	} else {
+		i := []byte{}
+		err = db.Get(&i, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
+			jiaUserID, jiaIsuUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.String(http.StatusNotFound, "not found: isu")
+			}
 
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		imageCacher.Save(jiaIsuUUID, ImageCacheData{image: i, userId: jiaUserID})
+		return c.Blob(http.StatusOK, "", i)
 	}
-
-	return c.Blob(http.StatusOK, "", image)
 }
 
 // GET /api/isu/:jia_isu_uuid/graph
@@ -1294,7 +1325,7 @@ func getTrend(c echo.Context) error {
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
 	// TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-	dropProbability := 0.3
+	dropProbability := 0.7
 	if rand.Float64() <= dropProbability {
 		c.Logger().Warnf("drop post isu condition request")
 		return c.NoContent(http.StatusAccepted)
