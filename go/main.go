@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/exec"
 	"sort"
@@ -41,7 +42,7 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
-	cacheTimeForTrend           = time.Second * 1
+	cacheTimeForTrend           = time.Millisecond * 500
 )
 
 var (
@@ -402,6 +403,13 @@ func main() {
 	e.GET("/register", getIndex)
 	e.Static("/assets", frontendContentsPath+"/assets")
 
+	pprofGroup := e.Group("/debug/pprof")
+	pprofGroup.Any("/cmdline", echo.WrapHandler(http.HandlerFunc(pprof.Cmdline)))
+	pprofGroup.Any("/profile", echo.WrapHandler(http.HandlerFunc(pprof.Profile)))
+	pprofGroup.Any("/symbol", echo.WrapHandler(http.HandlerFunc(pprof.Symbol)))
+	pprofGroup.Any("/trace", echo.WrapHandler(http.HandlerFunc(pprof.Trace)))
+	pprofGroup.Any("/*", echo.WrapHandler(http.HandlerFunc(pprof.Index)))
+
 	mySQLConnectionData = NewMySQLConnectionEnv()
 
 	var err error
@@ -683,10 +691,14 @@ func getIsuList(c echo.Context) error {
 
 		var formattedCondition *GetIsuConditionResponse
 		if foundLastCondition {
-			conditionLevel, err := calculateConditionLevel(lastCondition.Condition)
-			if err != nil {
-				c.Logger().Error(err)
-				return c.NoContent(http.StatusInternalServerError)
+			conditionLevel := lastCondition.ConditionLevel
+			if conditionLevel == "" {
+				conditionLevel, err = calculateConditionLevel(lastCondition.Condition)
+				if err != nil {
+					c.Logger().Error(err)
+					return c.NoContent(http.StatusInternalServerError)
+				}
+
 			}
 
 			formattedCondition = &GetIsuConditionResponse{
@@ -1280,19 +1292,23 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 	conditionsResponse := make([]*GetIsuConditionResponse, limit)
 	i := 0
 	for _, c := range conditions {
-		cLevel, err := calculateConditionLevel(c.Condition)
-		if err != nil {
-			continue
+		cLevel := c.ConditionLevel
+		if cLevel == "" {
+			cLevel, err = calculateConditionLevel(c.Condition)
+			if err != nil {
+				continue
+			}
+			c.ConditionLevel = cLevel
 		}
 
-		if _, ok := conditionLevel[cLevel]; ok {
+		if _, ok := conditionLevel[c.ConditionLevel]; ok {
 			data := GetIsuConditionResponse{
 				JIAIsuUUID:     c.JIAIsuUUID,
 				IsuName:        isuName,
 				Timestamp:      c.Timestamp.Unix(),
 				IsSitting:      c.IsSitting,
 				Condition:      c.Condition,
-				ConditionLevel: cLevel,
+				ConditionLevel: c.ConditionLevel,
 				Message:        c.Message,
 			}
 			conditionsResponse[i] = &data
@@ -1358,17 +1374,6 @@ func getTrend(c echo.Context) error {
 			characterCriticalIsuConditions := []*TrendCondition{}
 			for _, isu := range isuList {
 				conditions := isuConditionCacher.Get(isu.JIAIsuUUID)
-				/*
-					conditions := []IsuCondition{}
-					err = db.Select(&conditions,
-						"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY timestamp DESC",
-						isu.JIAIsuUUID,
-					)
-					if err != nil {
-						c.Logger().Errorf("db error: %v", err)
-						return c.NoContent(http.StatusInternalServerError)
-					}
-				*/
 				if len(conditions) > 0 {
 					isuLastCondition := conditions[len(conditions)-1]
 					conditionLevel, err := calculateConditionLevel(isuLastCondition.Condition)
@@ -1419,7 +1424,7 @@ func getTrend(c echo.Context) error {
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
 	// TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-	dropProbability := 0.7
+	dropProbability := 0.3
 	if rand.Float64() <= dropProbability {
 		c.Logger().Warnf("drop post isu condition request")
 		return c.NoContent(http.StatusAccepted)
