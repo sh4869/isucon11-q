@@ -1513,11 +1513,13 @@ func postIsuCondition(c echo.Context) error {
 	for i, cond := range conds {
 		cond.ID = maxId - len(req) + i + 1
 	}
+	go func() {
+		q := "INSERT INTO `isu_condition`" +
+			"	(`id`, `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)" +
+			"	VALUES (:id, :jia_isu_uuid, :timestamp, :is_sitting, :condition, :message, :created_at)"
+		_, err = db.NamedExec(q, conds)
+	}()
 
-	q := "INSERT INTO `isu_condition`" +
-		"	(`id`, `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)" +
-		"	VALUES (:id, :jia_isu_uuid, :timestamp, :is_sitting, :condition, :message, :created_at)"
-	_, err = db.NamedExec(q, conds)
 	isuConditionCacher.Add(jiaIsuUUID, conds)
 
 	return c.NoContent(http.StatusAccepted)
