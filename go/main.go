@@ -55,6 +55,7 @@ var (
 	trendCacher                   TrendCacher
 	isuConditionCacher            IsuConditionCache
 	imageCacher                   ImageCache
+	isuConditionIdManager         IsuConditionIdManager
 )
 
 type TrendCacher struct {
@@ -137,6 +138,23 @@ func (i *ImageCache) Get(key string) ImageCacheData {
 
 }
 
+type IsuConditionIdManager struct {
+	mu sync.Mutex
+	id int
+}
+
+func (i *IsuConditionIdManager) Init(nid int) {
+	i.mu.Lock()
+	i.id = nid
+	i.mu.Unlock()
+}
+
+func (i *IsuConditionIdManager) Increment(count int) int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.id += count
+	return i.id
+}
 type Config struct {
 	Name string `db:"name"`
 	URL  string `db:"url"`
@@ -296,6 +314,7 @@ func main() {
 	trendCacher = TrendCacher{}
 	isuConditionCacher = IsuConditionCache{cache: map[string][]IsuCondition{}}
 	imageCacher = ImageCache{m: sync.Map{}}
+	isuConditionIdManager = IsuConditionIdManager{}
 
 	e := echo.New()
 	// e.Debug = true
@@ -426,6 +445,9 @@ func postInitialize(c echo.Context) error {
 	_ = db.Select(&conditions, "SELECT * from `isu_condition` ORDER BY `timestamp`")
 	isuConditionCacher.AddList(conditions)
 
+	var max int
+	_ = db.Get(&max, "SELECT MAX(id) from `isu_condition`")
+	isuConditionIdManager.Init(max)
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
 	})
@@ -1360,27 +1382,29 @@ func postIsuCondition(c echo.Context) error {
 	if count == 0 {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
-	conds := []IsuCondition{}
-	for _, cond := range req {
-		timestamp := time.Unix(cond.Timestamp, 0)
 
+	conds := make([]IsuCondition, len(req))
+	for i, cond := range req {
+		timestamp := time.Unix(cond.Timestamp, 0)
 		if !isValidConditionFormat(cond.Condition) {
 			return c.String(http.StatusBadRequest, "bad request body")
 		}
 		now := time.Now()
-		r, err := tx.Exec(
-			"INSERT INTO `isu_condition`"+
-				"	(`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)"+
-				"	VALUES (?, ?, ?, ?, ?, ?)",
-			jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message, now)
-		if err != nil {
-			c.Logger().Errorf("db error: %v", err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
-		id, err := r.LastInsertId()
-		level, err := calculateConditionLevel(cond.Condition)
-		conds = append(conds, IsuCondition{
-			ID:             int(id),
+		/*
+			r, err := tx.Exec(
+				"INSERT INTO `isu_condition`"+
+					"	(`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)"+
+					"	VALUES (?, ?, ?, ?, ?, ?)",
+				jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message, now)
+
+			if err != nil {
+				c.Logger().Errorf("db error: %v", err)
+				return c.NoContent(http.StatusInternalServerError)
+			}
+			id, err := r.LastInsertId()
+		*/
+		level, _ := calculateConditionLevel(cond.Condition)
+		conds[i] = IsuCondition{
 			JIAIsuUUID:     jiaIsuUUID,
 			Timestamp:      timestamp,
 			IsSitting:      cond.IsSitting,
@@ -1388,10 +1412,16 @@ func postIsuCondition(c echo.Context) error {
 			Message:        cond.Message,
 			CreatedAt:      now,
 			ConditionLevel: level,
-		})
+		}
 	}
-
-	err = tx.Commit()
+	maxId := isuConditionIdManager.Increment(len(req))
+	for i, cond := range conds {
+		cond.ID = maxId - len(req) + i + 1
+	}
+	q := "INSERT INTO `isu_condition`" +
+		"	(`id`, `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)" +
+		"	VALUES (:id, :jia_isu_uuid, :timestamp, :is_sitting, :condition, :message, :created_at)"
+	_, err = db.NamedExec(q, conds)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
