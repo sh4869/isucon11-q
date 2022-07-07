@@ -56,6 +56,8 @@ var (
 	isuConditionCacher            IsuConditionCache
 	imageCacher                   ImageCache
 	isuConditionIdManager         IsuConditionIdManager
+	isuJiaUUIDList                JiaIsuUUIDList
+	jiaUserIdList                 JiaUserIdList
 )
 
 type TrendCacher struct {
@@ -155,6 +157,59 @@ func (i *IsuConditionIdManager) Increment(count int) int {
 	i.id += count
 	return i.id
 }
+
+type JiaIsuUUIDList struct {
+	mu   sync.RWMutex
+	list map[string]struct{}
+}
+
+func (i *JiaIsuUUIDList) Add(id string) {
+	i.mu.Lock()
+	i.list[id] = struct{}{}
+	i.mu.Unlock()
+}
+
+func (i *JiaIsuUUIDList) AddAll(ids []string) {
+	i.mu.Lock()
+	for _, id := range ids {
+		i.list[id] = struct{}{}
+	}
+	i.mu.Unlock()
+}
+
+func (i *JiaIsuUUIDList) Has(id string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	_, ok := i.list[id]
+	return ok
+}
+
+type JiaUserIdList struct {
+	mu   sync.RWMutex
+	list map[string]struct{}
+}
+
+func (i *JiaUserIdList) Add(id string) {
+	i.mu.Lock()
+	i.list[id] = struct{}{}
+	i.mu.Unlock()
+}
+
+func (i *JiaUserIdList) AddAll(ids []string) {
+	i.mu.Lock()
+	for _, id := range ids {
+		i.list[id] = struct{}{}
+	}
+	i.mu.Unlock()
+}
+
+func (i *JiaUserIdList) Has(id string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	_, ok := i.list[id]
+	return ok
+}
+
 type Config struct {
 	Name string `db:"name"`
 	URL  string `db:"url"`
@@ -315,6 +370,8 @@ func main() {
 	isuConditionCacher = IsuConditionCache{cache: map[string][]IsuCondition{}}
 	imageCacher = ImageCache{m: sync.Map{}}
 	isuConditionIdManager = IsuConditionIdManager{}
+	isuJiaUUIDList = JiaIsuUUIDList{list: map[string]struct{}{}}
+	jiaUserIdList = JiaUserIdList{list: map[string]struct{}{}}
 
 	e := echo.New()
 	// e.Debug = true
@@ -387,15 +444,17 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 
 	jiaUserID := _jiaUserID.(string)
 	var count int
+	if !jiaUserIdList.Has(jiaUserID) {
+		err = db.Get(&count, "SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?",
+			jiaUserID)
+		if err != nil {
+			return "", http.StatusInternalServerError, fmt.Errorf("db error: %v", err)
+		}
 
-	err = db.Get(&count, "SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?",
-		jiaUserID)
-	if err != nil {
-		return "", http.StatusInternalServerError, fmt.Errorf("db error: %v", err)
-	}
-
-	if count == 0 {
-		return "", http.StatusUnauthorized, fmt.Errorf("not found: user")
+		if count == 0 {
+			return "", http.StatusUnauthorized, fmt.Errorf("not found: user")
+		}
+		jiaUserIdList.Add(jiaUserID)
 	}
 
 	return jiaUserID, 0, nil
@@ -448,6 +507,15 @@ func postInitialize(c echo.Context) error {
 	var max int
 	_ = db.Get(&max, "SELECT MAX(id) from `isu_condition`")
 	isuConditionIdManager.Init(max)
+
+	var list []string
+	db.Select(&list, "SELECT jia_isu_uuid from isu")
+	isuJiaUUIDList.AddAll(list)
+
+	var ulist []string
+	db.Select(&ulist, "SELECT jia_user_id FROM `user`")
+	jiaUserIdList.AddAll(ulist)
+
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
 	})
@@ -780,7 +848,7 @@ func postIsu(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-
+	isuJiaUUIDList.Add(jiaIsuUUID)
 	return c.JSON(http.StatusCreated, isu)
 }
 
@@ -1366,21 +1434,25 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	defer tx.Rollback()
+	/*
+		tx, err := db.Beginx()
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		defer tx.Rollback()
+	*/
 
-	var count int
-	err = tx.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	if count == 0 {
-		return c.String(http.StatusNotFound, "not found: isu")
+	if !isuJiaUUIDList.Has(jiaIsuUUID) {
+		var count int
+		err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if count == 0 {
+			return c.String(http.StatusNotFound, "not found: isu")
+		}
 	}
 
 	conds := make([]IsuCondition, len(req))
