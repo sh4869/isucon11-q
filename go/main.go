@@ -161,28 +161,27 @@ func (i *IsuConditionIdManager) Increment(count int) int {
 
 type JiaIsuUUIDList struct {
 	mu   sync.RWMutex
-	list map[string]struct{}
+	list map[string]Isu
 }
 
-func (i *JiaIsuUUIDList) Add(id string) {
+func (i *JiaIsuUUIDList) Add(isu Isu) {
 	i.mu.Lock()
-	i.list[id] = struct{}{}
+	i.list[isu.JIAIsuUUID] = isu
 	i.mu.Unlock()
 }
 
-func (i *JiaIsuUUIDList) AddAll(ids []string) {
+func (i *JiaIsuUUIDList) AddAll(isus []Isu) {
 	i.mu.Lock()
-	for _, id := range ids {
-		i.list[id] = struct{}{}
+	for _, isu := range isus {
+		i.list[isu.JIAIsuUUID] = isu
 	}
 	i.mu.Unlock()
 }
 
-func (i *JiaIsuUUIDList) Has(id string) bool {
+func (i *JiaIsuUUIDList) Get(id string) Isu {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	_, ok := i.list[id]
-	return ok
+	return i.list[id]
 }
 
 type JiaUserIdList struct {
@@ -371,7 +370,7 @@ func main() {
 	isuConditionCacher = IsuConditionCache{cache: map[string][]IsuCondition{}}
 	imageCacher = ImageCache{m: sync.Map{}}
 	isuConditionIdManager = IsuConditionIdManager{}
-	isuJiaUUIDList = JiaIsuUUIDList{list: map[string]struct{}{}}
+	isuJiaUUIDList = JiaIsuUUIDList{list: map[string]Isu{}}
 	jiaUserIdList = JiaUserIdList{list: map[string]struct{}{}}
 
 	e := echo.New()
@@ -516,8 +515,8 @@ func postInitialize(c echo.Context) error {
 	_ = db.Get(&max, "SELECT MAX(id) from `isu_condition`")
 	isuConditionIdManager.Init(max)
 
-	var list []string
-	db.Select(&list, "SELECT jia_isu_uuid from isu")
+	var list []Isu
+	db.Select(&list, "SELECT * from isu")
 	isuJiaUUIDList.AddAll(list)
 
 	var ulist []string
@@ -860,7 +859,7 @@ func postIsu(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	isuJiaUUIDList.Add(jiaIsuUUID)
+	isuJiaUUIDList.Add(isu)
 	return c.JSON(http.StatusCreated, isu)
 }
 
@@ -965,15 +964,18 @@ func getIsuGraph(c echo.Context) error {
 		defer tx.Rollback()
 	*/
 
-	var count int
-	err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	if count == 0 {
-		return c.String(http.StatusNotFound, "not found: isu")
+	isu := isuJiaUUIDList.Get(jiaIsuUUID)
+	if !(isu.ID != 0 && isu.JIAIsuUUID == jiaIsuUUID && isu.JIAUserID == jiaUserID) {
+		var count int
+		err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
+			jiaUserID, jiaIsuUUID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if count == 0 {
+			return c.String(http.StatusNotFound, "not found: isu")
+		}
 	}
 
 	res, err := generateIsuGraphResponse(jiaIsuUUID, date)
@@ -1193,17 +1195,22 @@ func getIsuConditions(c echo.Context) error {
 	}
 
 	var isuName string
-	err = db.Get(&isuName,
-		"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
-		jiaIsuUUID, jiaUserID,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.String(http.StatusNotFound, "not found: isu")
-		}
+	isu := isuJiaUUIDList.Get(jiaIsuUUID)
+	if !(isu.ID != 0 && isu.JIAIsuUUID == jiaIsuUUID && isu.JIAUserID == jiaUserID) {
+		err = db.Get(&isuName,
+			"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
+			jiaIsuUUID, jiaUserID,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.String(http.StatusNotFound, "not found: isu")
+			}
 
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+	} else {
+		isuName = isu.Name
 	}
 
 	conditionsResponse, err := getIsuConditionsFromDB(db, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName, c)
@@ -1229,7 +1236,10 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 			conditions = make([]IsuCondition, i)
 			copy(conditions, a[:i])
 		}
-		sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
+		for i := 0; i < len(conditions)/2; i++ {
+			conditions[i], conditions[len(conditions)-i-1] = conditions[len(conditions)-i-1], conditions[i]
+		}
+		//sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
 		/*
 			s := "!!!!(end)"
 			for _, c := range conditions {
@@ -1260,7 +1270,10 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 			// all := make([]IsuCondition, len(a))
 			conditions = make([]IsuCondition, end-start)
 			copy(conditions, a[start:end])
-			sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
+			//sort.Slice(conditions, func(i, j int) bool { return conditions[i].Timestamp.After(conditions[j].Timestamp) })
+			for i := 0; i < len(conditions)/2; i++ {
+				conditions[i], conditions[len(conditions)-i-1] = conditions[len(conditions)-i-1], conditions[i]
+			}
 		}
 		/*
 			c.Logger().Info(all)
@@ -1452,7 +1465,8 @@ func postIsuCondition(c echo.Context) error {
 		defer tx.Rollback()
 	*/
 
-	if !isuJiaUUIDList.Has(jiaIsuUUID) {
+	isu := isuJiaUUIDList.Get(jiaIsuUUID)
+	if !(isu.JIAIsuUUID != "" && isu.JIAIsuUUID == jiaIsuUUID) {
 		var count int
 		err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID)
 		if err != nil {
@@ -1499,14 +1513,11 @@ func postIsuCondition(c echo.Context) error {
 	for i, cond := range conds {
 		cond.ID = maxId - len(req) + i + 1
 	}
+
 	q := "INSERT INTO `isu_condition`" +
 		"	(`id`, `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`, `created_at`)" +
 		"	VALUES (:id, :jia_isu_uuid, :timestamp, :is_sitting, :condition, :message, :created_at)"
 	_, err = db.NamedExec(q, conds)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
 	isuConditionCacher.Add(jiaIsuUUID, conds)
 
 	return c.NoContent(http.StatusAccepted)
