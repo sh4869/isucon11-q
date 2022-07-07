@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -42,7 +41,7 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
-	cacheTimeForTrend           = time.Millisecond * 500
+	cacheTimeForTrend           = time.Second * 1
 )
 
 var (
@@ -182,6 +181,10 @@ func (i *JiaIsuUUIDList) Get(id string) Isu {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.list[id]
+}
+
+func (i *JiaIsuUUIDList) GetAll() map[string]Isu {
+	return i.list
 }
 
 type JiaUserIdList struct {
@@ -563,10 +566,13 @@ func postAuthentication(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "invalid JWT payload")
 	}
 
-	_, err = db.Exec("INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)", jiaUserID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	if !jiaUserIdList.Has(jiaUserID) {
+		_, err = db.Exec("INSERT IGNORE INTO user (`jia_user_id`) VALUES (?)", jiaUserID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		jiaUserIdList.Add(jiaUserID)
 	}
 
 	session, err := getSession(c.Request())
@@ -644,22 +650,32 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	defer tx.Rollback()
-
+	/*
+		tx, err := db.Beginx()
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		defer tx.Rollback()
+	*/
 	isuList := []Isu{}
-	err = tx.Select(
-		&isuList,
-		"SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
-		jiaUserID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	isus := isuJiaUUIDList.GetAll()
+	for _, isu := range isus {
+		if isu.JIAUserID == jiaUserID {
+			isuList = append(isuList, isu)
+		}
 	}
+	sort.Slice(isuList, func(i, j int) bool { return isuList[i].ID > isuList[j].ID })
+	/*
+		err = tx.Select(
+			&isuList,
+			"SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
+			jiaUserID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+	*/
 
 	responseList := []GetIsuListResponse{}
 	for _, isu := range isuList {
@@ -720,11 +736,13 @@ func getIsuList(c echo.Context) error {
 		responseList = append(responseList, res)
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
+	/*
+		err = tx.Commit()
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+	*/
 
 	return c.JSON(http.StatusOK, responseList)
 }
@@ -878,18 +896,19 @@ func getIsuID(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
-	var res Isu
-	err = db.Get(&res, "SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.String(http.StatusNotFound, "not found: isu")
+	res := isuJiaUUIDList.Get(jiaIsuUUID)
+	if !(res.ID != 0 && res.JIAUserID == jiaUserID) {
+		err = db.Get(&res, "SELECT * FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
+			jiaUserID, jiaIsuUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.String(http.StatusNotFound, "not found: isu")
+			}
+
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
 		}
-
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
 	}
-
 	return c.JSON(http.StatusOK, res)
 }
 
@@ -1362,26 +1381,13 @@ func getTrend(c echo.Context) error {
 	if len(trends) != 0 && lastSaved.After(time.Now().Add(-cacheTimeForTrend)) {
 		return c.JSON(http.StatusOK, trends)
 	} else {
-		characterList := []Isu{}
-		err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
-		if err != nil {
-			c.Logger().Errorf("db error: %v", err)
-			return c.NoContent(http.StatusInternalServerError)
+		isus := isuJiaUUIDList.GetAll()
+		isuMap := map[string][]Isu{}
+		for _, isu := range isus {
+			isuMap[isu.Character] = append(isuMap[isu.Character], isu)
 		}
-
 		res := []TrendResponse{}
-
-		for _, character := range characterList {
-			isuList := []Isu{}
-			err = db.Select(&isuList,
-				"SELECT * FROM `isu` WHERE `character` = ?",
-				character.Character,
-			)
-			if err != nil {
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-
+		for character, isuList := range isuMap {
 			characterInfoIsuConditions := []*TrendCondition{}
 			characterWarningIsuConditions := []*TrendCondition{}
 			characterCriticalIsuConditions := []*TrendCondition{}
@@ -1389,16 +1395,20 @@ func getTrend(c echo.Context) error {
 				conditions := isuConditionCacher.Get(isu.JIAIsuUUID)
 				if len(conditions) > 0 {
 					isuLastCondition := conditions[len(conditions)-1]
-					conditionLevel, err := calculateConditionLevel(isuLastCondition.Condition)
-					if err != nil {
-						c.Logger().Error(err)
-						return c.NoContent(http.StatusInternalServerError)
+					if isuLastCondition.ConditionLevel == "" {
+						conditionLevel, err := calculateConditionLevel(isuLastCondition.Condition)
+						if err != nil {
+							c.Logger().Error(err)
+							return c.NoContent(http.StatusInternalServerError)
+						}
+						isuLastCondition.ConditionLevel = conditionLevel
 					}
+
 					trendCondition := TrendCondition{
 						ID:        isu.ID,
 						Timestamp: isuLastCondition.Timestamp.Unix(),
 					}
-					switch conditionLevel {
+					switch isuLastCondition.ConditionLevel {
 					case "info":
 						characterInfoIsuConditions = append(characterInfoIsuConditions, &trendCondition)
 					case "warning":
@@ -1421,7 +1431,7 @@ func getTrend(c echo.Context) error {
 			})
 			res = append(res,
 				TrendResponse{
-					Character: character.Character,
+					Character: character,
 					Info:      characterInfoIsuConditions,
 					Warning:   characterWarningIsuConditions,
 					Critical:  characterCriticalIsuConditions,
@@ -1437,11 +1447,13 @@ func getTrend(c echo.Context) error {
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
 	// TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-	dropProbability := 0.3
-	if rand.Float64() <= dropProbability {
-		c.Logger().Warnf("drop post isu condition request")
-		return c.NoContent(http.StatusAccepted)
-	}
+	/*
+		dropProbability := 0.0
+		if rand.Float64() <= dropProbability {
+			c.Logger().Warnf("drop post isu condition request")
+			return c.NoContent(http.StatusAccepted)
+		}
+	*/
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 	if jiaIsuUUID == "" {
